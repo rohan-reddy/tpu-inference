@@ -196,6 +196,53 @@ def process_moe_weights(
         w2_bias = w2_bias.astype(jnp.float32)
         w2_bias = jnp.expand_dims(w2_bias, 1)
 
+    # For GMM backends, pre-align K and N dimensions to TPU lane boundaries
+    # so gmm_v2 doesn't need to pad weights at inference time.
+    # After swapaxes above, shapes are:
+    #   w13_weight: (E, hidden_size, 2*intermediate_size)  K=dim1, N=dim2
+    #   w2_weight:  (E, intermediate_size, hidden_size)    K=dim1, N=dim2
+    # w13 N uses 2*align_to(intermediate_size) (not align_to(2*intermediate))
+    # so jnp.split(gmm1_output, 2) halves match w2's padded K.
+    # Activation padding and output slicing are handled by fused_moe_func.
+    if moe_backend in (MoEBackend.GMM_TP, MoEBackend.GMM_EP):
+        num_lanes = 128
+        # For GMM_TP, intermediate_size dims are sharded across devices.
+        # Align to num_lanes * num_shards so per-shard dims stay aligned.
+        if moe_backend == MoEBackend.GMM_TP:
+            intermediate_alignment = num_lanes * w13_reorder_size
+        else:
+            intermediate_alignment = num_lanes
+
+        padded_hidden = align_to(hidden_size, num_lanes)
+        padded_intermediate = align_to(intermediate_size,
+                                       intermediate_alignment)
+
+        k13_pad = padded_hidden - hidden_size
+        n13_pad = 2 * padded_intermediate - 2 * intermediate_size
+        k2_pad = padded_intermediate - intermediate_size
+        n2_pad = padded_hidden - hidden_size
+
+        if k13_pad or n13_pad:
+            w13_weight = jnp.pad(w13_weight,
+                                 ((0, 0), (0, k13_pad), (0, n13_pad)))
+        if k2_pad or n2_pad:
+            w2_weight = jnp.pad(w2_weight, ((0, 0), (0, k2_pad), (0, n2_pad)))
+
+        if w13_weight_scale is not None and n13_pad:
+            w13_weight_scale = jnp.pad(w13_weight_scale,
+                                       ((0, 0), (0, 0), (0, 0), (0, n13_pad)))
+        if w2_weight_scale is not None and n2_pad:
+            w2_weight_scale = jnp.pad(w2_weight_scale,
+                                      ((0, 0), (0, 0), (0, 0), (0, n2_pad)))
+
+        if w13_bias is not None and n13_pad:
+            w13_bias = jnp.pad(w13_bias, ((0, 0), (0, 0), (0, n13_pad)))
+        if w2_bias is not None and n2_pad:
+            w2_bias = jnp.pad(w2_bias, ((0, 0), (0, 0), (0, n2_pad)))
+
+        hidden_size = padded_hidden
+        intermediate_size = padded_intermediate
+
     match moe_backend:
         case MoEBackend.FUSED_MOE:
             # Kernel expects:

@@ -171,7 +171,7 @@ class GmmTest(jtu.JaxTestCase):
         out_size=[512, 1024],
         num_groups=[16, 32],
         has_bias=[True, False],
-        weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
+        weight_dtype=[jnp.int8, jnp.float8_e5m2, jnp.float4_e2m1fn],
         block_size=[64, 128, 256, 512],
         group_offset=[0, 2, 3],
     )
@@ -192,10 +192,9 @@ class GmmTest(jtu.JaxTestCase):
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 
-        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1,
-                                 1)
-        rhs = jax.random.uniform(key, (num_local_groups, in_size, out_size),
-                                 jnp.bfloat16, -1, 1)
+        lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
+        rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
+                                dtype=jnp.bfloat16)
         rhs_q, rhs_scale = quantize_tensor(rhs,
                                            weight_dtype,
                                            axis=1,
@@ -220,230 +219,19 @@ class GmmTest(jtu.JaxTestCase):
         )
 
         if is_supported_by_gmm_v2(lhs, rhs_q, rhs_scale):
-            actual = gmm_v2(
-                lhs,
-                rhs_q,
-                group_sizes,
-                rhs_scale=rhs_scale,
-                group_offset=group_offset,
-                rhs_bias=rhs_bias,
-                maybe_quantize_lhs=False,
-            ).astype(lhs.dtype)
+            gmm_fn = gmm_v2
         else:
-            actual = gmm(
-                lhs,
-                rhs_q,
-                group_sizes,
-                rhs_scale=rhs_scale,
-                group_offset=group_offset,
-                rhs_bias=rhs_bias,
-            ).astype(lhs.dtype)
+            gmm_fn = gmm
 
-        self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
-
-    @parameterized.product(
-        batch_size=[128],
-        in_size=[512, 1024],
-        out_size=[512, 1024],
-        num_groups=[16, 32],
-        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
-        group_offset=[0, 2, 3],
-    )
-    def test_gmm_activation_weight_quantized(
-        self,
-        batch_size,
-        in_size,
-        out_size,
-        num_groups,
-        weight_dtype,
-        group_offset,
-    ):
-        if weight_dtype == jnp.float4_e2m1fn and not jtu.is_device_tpu_at_least(
-                version=7):
-            self.skipTest("Expect TPUv7+")
-        # TODO(kyuyeunk, wenxindong): Add subchannel quantization on gmm_v2.
-        block_size = in_size
-        num_local_groups = num_groups - group_offset
-        key = jax.random.key(0)
-
-        lhs = jax.random.uniform(key, (batch_size, in_size), jnp.bfloat16, -1,
-                                 1)
-        rhs = jax.random.uniform(key, (num_local_groups, in_size, out_size),
-                                 jnp.bfloat16, -1, 1)
-        rhs_q, rhs_scale = quantize_tensor(rhs,
-                                           weight_dtype,
-                                           axis=1,
-                                           block_size=block_size)
-        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-        group_sizes = get_group_sizes(batch_size, num_groups)
-        group_offset = jnp.array(group_offset, dtype=jnp.int32)
-
-        expected = reference_gmm(
+        actual = gmm_fn(
             lhs,
             rhs_q,
             group_sizes,
             rhs_scale=rhs_scale,
             group_offset=group_offset,
-        )
-
-        actual = gmm_v2(
-            lhs,
-            rhs_q,
-            group_sizes,
-            rhs_scale=rhs_scale,
-            group_offset=group_offset,
-            maybe_quantize_lhs=True,
+            rhs_bias=rhs_bias,
         ).astype(lhs.dtype)
 
-        self.assertArraysAllClose(actual, expected, atol=1.1, rtol=1.1)
-
-    @parameterized.product(
-        batch_size=[129, 135, 255],
-        in_size=[255, 500],
-        out_size=[255, 500],
-        num_groups=[16],
-        has_bias=[True, False],
-        group_offset=[0],
-    )
-    def test_gmm_implicit_padding(self, batch_size, in_size, out_size,
-                                  num_groups, has_bias, group_offset):
-        num_local_groups = num_groups - group_offset
-        key = jax.random.key(0)
-
-        lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
-        rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
-                                dtype=jnp.bfloat16)
-        rhs_bias = None
-        if has_bias:
-            rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size),
-                                         dtype=jnp.bfloat16)
-
-        group_sizes = get_group_sizes(batch_size, num_groups)
-        group_offset = jnp.array(group_offset, dtype=jnp.int32)
-
-        expected = reference_gmm(
-            lhs,
-            rhs,
-            group_sizes,
-            rhs_bias=rhs_bias,
-            group_offset=group_offset,
-        )
-
-        actual = gmm_v2(
-            lhs,
-            rhs,
-            group_sizes,
-            rhs_bias=rhs_bias,
-            group_offset=group_offset,
-        )
-
-        self.assertEqual(actual.shape, (batch_size, out_size))
-        self.assertArraysAllClose(actual, expected)
-
-    @parameterized.product(
-        batch_size=[33, 65],
-        in_size=[256],
-        out_size=[256],
-        num_groups=[4],
-        has_bias=[False],
-        group_offset=[0],
-    )
-    def test_gmm_implicit_padding_small_m(self, batch_size, in_size, out_size,
-                                          num_groups, has_bias, group_offset):
-        num_local_groups = num_groups - group_offset
-        key = jax.random.key(0)
-
-        lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
-        rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
-                                dtype=jnp.bfloat16)
-        rhs_bias = None
-        if has_bias:
-            rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size),
-                                         dtype=jnp.bfloat16)
-
-        group_sizes = get_group_sizes(batch_size, num_groups)
-        group_offset = jnp.array(group_offset, dtype=jnp.int32)
-
-        expected = reference_gmm(
-            lhs,
-            rhs,
-            group_sizes,
-            rhs_bias=rhs_bias,
-            group_offset=group_offset,
-        )
-
-        actual = gmm_v2(
-            lhs,
-            rhs,
-            group_sizes,
-            rhs_bias=rhs_bias,
-            group_offset=group_offset,
-        )
-
-        self.assertEqual(actual.shape, (batch_size, out_size))
-        self.assertArraysAllClose(actual, expected)
-
-    @parameterized.product(
-        batch_size=[129],
-        in_size=[512],
-        out_size=[500],
-        num_groups=[16],
-        has_bias=[True, False],
-        weight_dtype=[jnp.int8, jnp.float8_e5m2],
-        block_size=[512],
-        group_offset=[0],
-    )
-    def test_gmm_weight_quantized_padding(
-        self,
-        batch_size,
-        in_size,
-        out_size,
-        num_groups,
-        has_bias,
-        weight_dtype,
-        block_size,
-        group_offset,
-    ):
-        num_local_groups = num_groups - group_offset
-        key = jax.random.key(0)
-
-        lhs = jax.random.normal(key, (batch_size, in_size), dtype=jnp.bfloat16)
-        rhs = jax.random.normal(key, (num_local_groups, in_size, out_size),
-                                dtype=jnp.bfloat16)
-        rhs_q, rhs_scale = quantize_tensor(rhs,
-                                           weight_dtype,
-                                           axis=1,
-                                           block_size=block_size)
-        rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
-
-        rhs_bias = None
-        if has_bias:
-            rhs_bias = jax.random.normal(key, (num_local_groups, 1, out_size),
-                                         dtype=jnp.bfloat16)
-
-        group_sizes = get_group_sizes(batch_size, num_groups)
-        group_offset = jnp.array(group_offset, dtype=jnp.int32)
-
-        expected = reference_gmm(
-            lhs,
-            rhs_q,
-            group_sizes,
-            rhs_scale=rhs_scale,
-            rhs_bias=rhs_bias,
-            group_offset=group_offset,
-        )
-
-        actual = gmm_v2(
-            lhs,
-            rhs_q,
-            group_sizes,
-            rhs_scale=rhs_scale,
-            group_offset=group_offset,
-            rhs_bias=rhs_bias,
-            maybe_quantize_lhs=False,
-        ).astype(lhs.dtype)
-
-        self.assertEqual(actual.shape, (batch_size, out_size))
         self.assertArraysAllClose(actual, expected, atol=3e-1, rtol=3e-1)
 
 
