@@ -260,6 +260,12 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
         )
         jax.block_until_ready(weights)
         t2 = time.time()
+        logger.info(
+            "[MoE sharding] w13_weight: %s, w2_weight: %s, w13_scale: %s, w2_scale: %s",
+            weights.w13_weight.sharding, weights.w2_weight.sharding,
+            weights.w13_weight_scale.sharding if weights.w13_weight_scale
+            is not None else None, weights.w2_weight_scale.sharding
+            if weights.w2_weight_scale is not None else None)
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
         jax.block_until_ready(weights)
