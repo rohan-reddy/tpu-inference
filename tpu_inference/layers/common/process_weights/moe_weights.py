@@ -474,34 +474,68 @@ def process_fp8_moe_weights(
         moe_logging_str += f" with block size {requant_block_size}"
     logger.info(moe_logging_str)
 
-    # Dequantize fp8 2d block quantized weights into fp32.
-    w13_weight = dequantize_tensor(w13_weight,
-                                   w13_weight_scale, (1, 2),
-                                   jnp.float32,
-                                   block_size=weight_block_size)
-    w2_weight = dequantize_tensor(w2_weight,
-                                  w2_weight_scale, (1, 2),
-                                  jnp.float32,
-                                  block_size=weight_block_size)
+    # Pre-compute pad widths and block sizes for requantization.
+    # Padding aligns dims to block_size so quantize_tensor doesn't fail.
+    # For standard models (dims divisible by block_size), padding is zero.
+    _, orig_hidden_size, orig_intermediate_size = w2_weight.shape
+    if requant_block_size is None:
+        w13_block_size = w13_weight.shape[-1]
+        w2_block_size = w2_weight.shape[-1]
+    else:
+        w13_block_size = w2_block_size = requant_block_size
+    hidden_size = align_to(orig_hidden_size, w13_block_size)
+    intermediate_size = align_to(orig_intermediate_size, w2_block_size)
+    w13_pad = ((0, 2 * (intermediate_size - orig_intermediate_size)),
+               (0, hidden_size - orig_hidden_size))
+    w2_pad = ((0, hidden_size - orig_hidden_size),
+              (0, intermediate_size - orig_intermediate_size))
+
+    def _requant_one_expert(carry, expert_inputs):
+        w13, w13_scale, w2, w2_scale = expert_inputs
+        # Dequant FP8 -> FP32. Axes are (0, 1) since scan removes the
+        # expert dim; originally (1, 2) on the 3D tensor.
+        w13_fp32 = dequantize_tensor(w13,
+                                     w13_scale, (0, 1),
+                                     jnp.float32,
+                                     block_size=weight_block_size)
+        w2_fp32 = dequantize_tensor(w2,
+                                    w2_scale, (0, 1),
+                                    jnp.float32,
+                                    block_size=weight_block_size)
+        # Pad to block alignment.
+        w13_fp32 = jnp.pad(w13_fp32, w13_pad)
+        w2_fp32 = jnp.pad(w2_fp32, w2_pad)
+        # Requant FP32 -> target dtype. Axis 1 is the contracting dim
+        # on the 2D tensor (originally axis 2 on the 3D tensor).
+        w13_q, w13_s = quantize_tensor(desired_quant_dtype, w13_fp32, 1,
+                                       w13_block_size)
+        w2_q, w2_s = quantize_tensor(desired_quant_dtype, w2_fp32, 1,
+                                     w2_block_size)
+        return carry, (w13_q, w13_s, w2_q, w2_s)
+
+    # Scan over axis 0 (experts), processing one expert at a time.
+    # Inside the SPMD jit, each device scans over its local experts
+    # simultaneously. XLA reuses the FP32 buffer across iterations,
+    # so peak memory is ~1 expert's FP32 intermediate instead of all.
+    _, (w13_q, w13_s, w2_q, w2_s) = jax.lax.scan(
+        _requant_one_expert,
+        init=None,
+        xs=(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
+    )
 
     w13_interleave = activation == "swigluoai"
     w13_reorder_size = get_mesh_shape_product(mesh,
                                               ShardingAxisName.MLP_TENSOR)
 
-    weights = quantize_moe_weights(
+    return process_moe_weights(
         FusedMoEWeights(
-            w13_weight=w13_weight,
-            w13_weight_scale=None,
+            w13_weight=w13_q,
+            w13_weight_scale=w13_s,
             w13_bias=None,
-            w2_weight=w2_weight,
-            w2_weight_scale=None,
+            w2_weight=w2_q,
+            w2_weight_scale=w2_s,
             w2_bias=None,
         ),
-        desired_quant_dtype,
-        requant_block_size,
-    )
-    return process_moe_weights(
-        weights,
         moe_backend=moe_backend,
         w13_reorder_size=w13_reorder_size,
         w13_interleave=w13_interleave,
