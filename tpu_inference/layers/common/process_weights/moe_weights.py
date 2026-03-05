@@ -438,6 +438,43 @@ def shard_fp8_moe_weights_to_tpu(
     return FusedMoEWeights(**result_fields)
 
 
+def _get_moe_weight_shardings(
+    weights: FusedMoEWeights,
+    moe_backend: MoEBackend,
+    mesh: Mesh,
+) -> FusedMoEWeights:
+    """Build sharding specs matching shard_moe_weights for use inside JIT."""
+    match moe_backend:
+        case MoEBackend.FUSED_MOE | MoEBackend.GMM_EP:
+            ep_sharding = NamedSharding(mesh, P(ShardingAxisName.EXPERT))
+            return FusedMoEWeights(
+                w13_weight=ep_sharding,
+                w13_weight_scale=ep_sharding,
+                w13_bias=ep_sharding,
+                w2_weight=ep_sharding,
+                w2_weight_scale=ep_sharding,
+                w2_bias=ep_sharding,
+            )
+        case MoEBackend.GMM_TP:
+            if (weights.w2_weight_scale is not None
+                    and weights.w2_weight_scale.shape[1] == 1):
+                w2_weight_scale_p_spec = P()
+            else:
+                w2_weight_scale_p_spec = P(None, ShardingAxisName.MLP_TENSOR)
+            return FusedMoEWeights(
+                w13_weight=NamedSharding(
+                    mesh, P(None, None, ShardingAxisName.MLP_TENSOR)),
+                w13_weight_scale=NamedSharding(
+                    mesh, P(None, None, None, ShardingAxisName.MLP_TENSOR)),
+                w13_bias=NamedSharding(
+                    mesh, P(None, None, ShardingAxisName.MLP_TENSOR)),
+                w2_weight=NamedSharding(
+                    mesh, P(None, ShardingAxisName.MLP_TENSOR, None)),
+                w2_weight_scale=NamedSharding(mesh, w2_weight_scale_p_spec),
+                w2_bias=NamedSharding(mesh, P(None, None, None)),
+            )
+
+
 @jax.jit(static_argnames=(
     "moe_backend",
     "mesh",
@@ -490,44 +527,68 @@ def process_fp8_moe_weights(
     w2_pad = ((0, hidden_size - orig_hidden_size),
               (0, intermediate_size - orig_intermediate_size))
 
-    def _requant_one_expert(carry, expert_inputs):
-        w13, w13_scale, w2, w2_scale = expert_inputs
-        # Dequant FP8 -> FP32. Axes are (0, 1) since scan removes the
-        # expert dim; originally (1, 2) on the 3D tensor.
+    # Batch size for scan: process this many experts per iteration.
+    # Larger batch = more TPU utilization but higher peak FP32 memory.
+    scan_batch_size = 4
+    num_experts = w13_weight.shape[0]
+
+    # Pad widths for the batched case (3D tensors with expert dim).
+    w13_pad_3d = ((0, 0), ) + w13_pad
+    w2_pad_3d = ((0, 0), ) + w2_pad
+
+    def _requant_expert_batch(carry, batch_inputs):
+        w13, w13_scale, w2, w2_scale = batch_inputs
+        # Dequant FP8 -> FP32. Axes (1, 2) are the weight dims.
         w13_fp32 = dequantize_tensor(w13,
-                                     w13_scale, (0, 1),
+                                     w13_scale, (1, 2),
                                      jnp.float32,
                                      block_size=weight_block_size)
         w2_fp32 = dequantize_tensor(w2,
-                                    w2_scale, (0, 1),
+                                    w2_scale, (1, 2),
                                     jnp.float32,
                                     block_size=weight_block_size)
         # Pad to block alignment.
-        w13_fp32 = jnp.pad(w13_fp32, w13_pad)
-        w2_fp32 = jnp.pad(w2_fp32, w2_pad)
-        # Requant FP32 -> target dtype. Axis 1 is the contracting dim
-        # on the 2D tensor (originally axis 2 on the 3D tensor).
-        w13_q, w13_s = quantize_tensor(desired_quant_dtype, w13_fp32, 1,
+        w13_fp32 = jnp.pad(w13_fp32, w13_pad_3d)
+        w2_fp32 = jnp.pad(w2_fp32, w2_pad_3d)
+        # Requant FP32 -> target dtype. Axis 2 is the contracting dim.
+        w13_q, w13_s = quantize_tensor(desired_quant_dtype, w13_fp32, 2,
                                        w13_block_size)
-        w2_q, w2_s = quantize_tensor(desired_quant_dtype, w2_fp32, 1,
+        w2_q, w2_s = quantize_tensor(desired_quant_dtype, w2_fp32, 2,
                                      w2_block_size)
         return carry, (w13_q, w13_s, w2_q, w2_s)
 
-    # Scan over axis 0 (experts), processing one expert at a time.
-    # Inside the SPMD jit, each device scans over its local experts
-    # simultaneously. XLA reuses the FP32 buffer across iterations,
-    # so peak memory is ~1 expert's FP32 intermediate instead of all.
-    _, (w13_q, w13_s, w2_q, w2_s) = jax.lax.scan(
-        _requant_one_expert,
-        init=None,
-        xs=(w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
-    )
+    if num_experts % scan_batch_size == 0 and num_experts > scan_batch_size:
+        num_batches = num_experts // scan_batch_size
+
+        def _reshape_to_batches(x):
+            return x.reshape(num_batches, scan_batch_size, *x.shape[1:])
+
+        def _reshape_from_batches(x):
+            return x.reshape(num_experts, *x.shape[2:])
+
+        xs = jax.tree.map(
+            _reshape_to_batches,
+            (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
+        )
+        _, (w13_q, w13_s, w2_q, w2_s) = jax.lax.scan(
+            _requant_expert_batch,
+            init=None,
+            xs=xs,
+        )
+        w13_q, w13_s, w2_q, w2_s = jax.tree.map(_reshape_from_batches,
+                                                (w13_q, w13_s, w2_q, w2_s))
+    else:
+        # Fallback: process all experts at once (no scan).
+        _, (w13_q, w13_s, w2_q, w2_s) = _requant_expert_batch(
+            None,
+            (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
+        )
 
     w13_interleave = activation == "swigluoai"
     w13_reorder_size = get_mesh_shape_product(mesh,
                                               ShardingAxisName.MLP_TENSOR)
 
-    return process_moe_weights(
+    out = process_moe_weights(
         FusedMoEWeights(
             w13_weight=w13_q,
             w13_weight_scale=w13_s,
@@ -540,3 +601,17 @@ def process_fp8_moe_weights(
         w13_reorder_size=w13_reorder_size,
         w13_interleave=w13_interleave,
     )
+
+    # Apply sharding constraints so the JIT output matches what
+    # shard_moe_weights expects. Without this, lax.scan loses the
+    # input sharding annotations and shard_moe_weights has to do
+    # an expensive reshard instead of being a no-op.
+    target_shardings = _get_moe_weight_shardings(out, moe_backend, mesh)
+    for field in fields(FusedMoEWeights):
+        key = field.name
+        weight = getattr(out, key)
+        if weight is not None:
+            sharding = getattr(target_shardings, key)
+            setattr(out, key,
+                    jax.lax.with_sharding_constraint(weight, sharding))
+    return out
