@@ -313,16 +313,21 @@ def process_moe_weights(
     )
 
 
-def shard_moe_weights(
+def _get_moe_weight_shardings(
     weights: FusedMoEWeights,
     moe_backend: MoEBackend,
     mesh: Mesh,
 ) -> FusedMoEWeights:
+    """Build sharding specs for MoE weights based on the backend type.
 
+    Returns a FusedMoEWeights where each field is a NamedSharding.
+    Used by both shard_moe_weights (for device_put) and
+    process_fp8_moe_weights (for sharding constraints inside JIT).
+    """
     match moe_backend:
         case MoEBackend.FUSED_MOE | MoEBackend.GMM_EP:
             ep_sharding = NamedSharding(mesh, P(ShardingAxisName.EXPERT))
-            weight_shardings = FusedMoEWeights(
+            return FusedMoEWeights(
                 w13_weight=ep_sharding,
                 w13_weight_scale=ep_sharding,
                 w13_bias=ep_sharding,
@@ -339,7 +344,7 @@ def shard_moe_weights(
                 w2_weight_scale_p_spec = P()
             else:
                 w2_weight_scale_p_spec = P(None, ShardingAxisName.MLP_TENSOR)
-            weight_shardings = FusedMoEWeights(
+            return FusedMoEWeights(
                 w13_weight=NamedSharding(
                     mesh,
                     P(None, None, ShardingAxisName.MLP_TENSOR),
@@ -364,6 +369,15 @@ def shard_moe_weights(
                     P(None, None, None),
                 ),  # (num_experts, 1, out_dim)
             )
+
+
+def shard_moe_weights(
+    weights: FusedMoEWeights,
+    moe_backend: MoEBackend,
+    mesh: Mesh,
+) -> FusedMoEWeights:
+
+    weight_shardings = _get_moe_weight_shardings(weights, moe_backend, mesh)
 
     match moe_backend:
         case MoEBackend.FUSED_MOE:
@@ -438,43 +452,6 @@ def shard_fp8_moe_weights_to_tpu(
     return FusedMoEWeights(**result_fields)
 
 
-def _get_moe_weight_shardings(
-    weights: FusedMoEWeights,
-    moe_backend: MoEBackend,
-    mesh: Mesh,
-) -> FusedMoEWeights:
-    """Build sharding specs matching shard_moe_weights for use inside JIT."""
-    match moe_backend:
-        case MoEBackend.FUSED_MOE | MoEBackend.GMM_EP:
-            ep_sharding = NamedSharding(mesh, P(ShardingAxisName.EXPERT))
-            return FusedMoEWeights(
-                w13_weight=ep_sharding,
-                w13_weight_scale=ep_sharding,
-                w13_bias=ep_sharding,
-                w2_weight=ep_sharding,
-                w2_weight_scale=ep_sharding,
-                w2_bias=ep_sharding,
-            )
-        case MoEBackend.GMM_TP:
-            if (weights.w2_weight_scale is not None
-                    and weights.w2_weight_scale.shape[1] == 1):
-                w2_weight_scale_p_spec = P()
-            else:
-                w2_weight_scale_p_spec = P(None, ShardingAxisName.MLP_TENSOR)
-            return FusedMoEWeights(
-                w13_weight=NamedSharding(
-                    mesh, P(None, None, ShardingAxisName.MLP_TENSOR)),
-                w13_weight_scale=NamedSharding(
-                    mesh, P(None, None, None, ShardingAxisName.MLP_TENSOR)),
-                w13_bias=NamedSharding(
-                    mesh, P(None, None, ShardingAxisName.MLP_TENSOR)),
-                w2_weight=NamedSharding(
-                    mesh, P(None, ShardingAxisName.MLP_TENSOR, None)),
-                w2_weight_scale=NamedSharding(mesh, w2_weight_scale_p_spec),
-                w2_bias=NamedSharding(mesh, P(None, None, None)),
-            )
-
-
 @jax.jit(static_argnames=(
     "moe_backend",
     "mesh",
@@ -527,10 +504,15 @@ def process_fp8_moe_weights(
     w2_pad = ((0, hidden_size - orig_hidden_size),
               (0, intermediate_size - orig_intermediate_size))
 
-    # Batch size for scan: process this many experts per iteration.
-    # Larger batch = more TPU utilization but higher peak FP32 memory.
-    scan_batch_size = 4
+    # How many full-expert-equivalents of FP32 memory to allow per scan step.
+    # Higher = faster requant but more peak HBM. Lower = slower but less peak.
+    # Consistent across TP/EP configs: budget * tp_size = experts_per_step.
+    requant_memory_budget = 0.5
+    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_TENSOR)
     num_experts = w13_weight.shape[0]
+    target = max(1, int(requant_memory_budget * tp_size))
+    scan_batch_size = max(d for d in range(1, target + 1)
+                          if num_experts % d == 0)
 
     # Pad widths for the batched case (3D tensors with expert dim).
     w13_pad_3d = ((0, 0), ) + w13_pad
@@ -557,32 +539,25 @@ def process_fp8_moe_weights(
                                      w2_block_size)
         return carry, (w13_q, w13_s, w2_q, w2_s)
 
-    if num_experts % scan_batch_size == 0 and num_experts > scan_batch_size:
-        num_batches = num_experts // scan_batch_size
+    num_batches = num_experts // scan_batch_size
 
-        def _reshape_to_batches(x):
-            return x.reshape(num_batches, scan_batch_size, *x.shape[1:])
+    def _reshape_to_batches(x):
+        return x.reshape(num_batches, scan_batch_size, *x.shape[1:])
 
-        def _reshape_from_batches(x):
-            return x.reshape(num_experts, *x.shape[2:])
+    def _reshape_from_batches(x):
+        return x.reshape(num_experts, *x.shape[2:])
 
-        xs = jax.tree.map(
-            _reshape_to_batches,
-            (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
-        )
-        _, (w13_q, w13_s, w2_q, w2_s) = jax.lax.scan(
-            _requant_expert_batch,
-            init=None,
-            xs=xs,
-        )
-        w13_q, w13_s, w2_q, w2_s = jax.tree.map(_reshape_from_batches,
-                                                (w13_q, w13_s, w2_q, w2_s))
-    else:
-        # Fallback: process all experts at once (no scan).
-        _, (w13_q, w13_s, w2_q, w2_s) = _requant_expert_batch(
-            None,
-            (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
-        )
+    xs = jax.tree.map(
+        _reshape_to_batches,
+        (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale),
+    )
+    _, (w13_q, w13_s, w2_q, w2_s) = jax.lax.scan(
+        _requant_expert_batch,
+        init=None,
+        xs=xs,
+    )
+    w13_q, w13_s, w2_q, w2_s = jax.tree.map(_reshape_from_batches,
+                                            (w13_q, w13_s, w2_q, w2_s))
 
     w13_interleave = activation == "swigluoai"
     w13_reorder_size = get_mesh_shape_product(mesh,
