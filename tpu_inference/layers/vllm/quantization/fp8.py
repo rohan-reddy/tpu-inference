@@ -250,6 +250,10 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
         jax.block_until_ready(input_weights)
         t1 = time.time()
 
+        dev = jax.local_devices()[0]
+        hbm_before = dev.memory_stats().get("bytes_in_use", 0)
+        peak_before = dev.memory_stats().get("peak_bytes_in_use", 0)
+
         weights = process_fp8_moe_weights(
             input_weights,
             moe_backend=self.moe_backend,
@@ -270,9 +274,18 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
             shard_moe_weights(weights, self.moe_backend, self.mesh))
         jax.block_until_ready(weights)
         t3 = time.time()
+        hbm_after = dev.memory_stats().get("bytes_in_use", 0)
+        peak_after = dev.memory_stats().get("peak_bytes_in_use", 0)
+        requant_peak_delta = peak_after - peak_before
         logger.info(
             "[MoE timing] shard_fp8_to_tpu: %.2fs, process_fp8_moe_weights: %.2fs, shard_moe_weights: %.2fs",
             t1 - t0, t2 - t1, t3 - t2)
+        logger.info(
+            "[MoE memory] hbm_before: %.2fMiB, hbm_after: %.2fMiB, "
+            "layer_delta: %.2fMiB, requant_peak_blowup: %.2fMiB",
+            hbm_before / (1024**2), hbm_after / (1024**2),
+            (hbm_after - hbm_before) / (1024**2),
+            requant_peak_delta / (1024**2))
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
