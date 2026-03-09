@@ -247,9 +247,13 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
         input_weights = shard_fp8_moe_weights_to_tpu(input_weights, self.mesh)
 
         dev = jax.local_devices()[0]
-        hbm_before = dev.memory_stats().get("bytes_in_use", 0)
-        peak_before = dev.memory_stats().get("peak_bytes_in_use", 0)
+        stats_before = dev.memory_stats()
+        hbm_before = stats_before.get("bytes_in_use", 0)
+        reserved_before = stats_before.get("bytes_reserved", 0)
+        peak_reserved_before = stats_before.get("peak_bytes_reserved", 0)
 
+        import time as _time
+        _t0 = _time.perf_counter()
         weights = process_fp8_moe_weights(
             input_weights,
             moe_backend=self.moe_backend,
@@ -258,18 +262,29 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
             # Convert to tuple so jax jit can hash it
             weight_block_size=weight_block_size,
         )
+        jax.block_until_ready(weights)
+        _t1 = _time.perf_counter()
+
+        stats_after_requant = dev.memory_stats()
+        reserved_after = stats_after_requant.get("bytes_reserved", 0)
+        peak_reserved_after = stats_after_requant.get("peak_bytes_reserved", 0)
+
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
 
-        hbm_after = dev.memory_stats().get("bytes_in_use", 0)
-        peak_after = dev.memory_stats().get("peak_bytes_in_use", 0)
-        requant_peak_delta = peak_after - peak_before
+        stats_after = dev.memory_stats()
+        hbm_after = stats_after.get("bytes_in_use", 0)
         logger.info(
-            "[MoE memory] hbm_before: %.2fMiB, hbm_after: %.2fMiB, "
-            "layer_delta: %.2fMiB, requant_peak_blowup: %.2fMiB",
-            hbm_before / (1024**2), hbm_after / (1024**2),
-            (hbm_after - hbm_before) / (1024**2),
-            requant_peak_delta / (1024**2))
+            "[MoE memory] layer_delta: %.2fMiB, "
+            "xla_reserved_before: %.2fMiB, xla_reserved_after: %.2fMiB, "
+            "xla_reserved_delta: %.2fMiB, "
+            "xla_peak_reserved: %.2fMiB, xla_peak_reserved_delta: %.2fMiB, "
+            "requant_time: %.3fs", (hbm_after - hbm_before) / (1024**2),
+            reserved_before / (1024**2), reserved_after / (1024**2),
+            (reserved_after - reserved_before) / (1024**2),
+            peak_reserved_after / (1024**2),
+            (peak_reserved_after - peak_reserved_before) / (1024**2),
+            _t1 - _t0)
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
