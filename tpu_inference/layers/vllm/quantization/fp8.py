@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
 from typing import Optional, Union
 
 import jax
@@ -245,10 +244,7 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
         if self.weight_block_size is not None:
             weight_block_size = tuple(self.weight_block_size)
 
-        t0 = time.time()
         input_weights = shard_fp8_moe_weights_to_tpu(input_weights, self.mesh)
-        jax.block_until_ready(input_weights)
-        t1 = time.time()
 
         weights = process_fp8_moe_weights(
             input_weights,
@@ -258,21 +254,8 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod):
             # Convert to tuple so jax jit can hash it
             weight_block_size=weight_block_size,
         )
-        jax.block_until_ready(weights)
-        t2 = time.time()
-        logger.info(
-            "[MoE sharding] w13_weight: %s, w2_weight: %s, w13_scale: %s, w2_scale: %s",
-            weights.w13_weight.sharding, weights.w2_weight.sharding,
-            weights.w13_weight_scale.sharding if weights.w13_weight_scale
-            is not None else None, weights.w2_weight_scale.sharding
-            if weights.w2_weight_scale is not None else None)
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
-        jax.block_until_ready(weights)
-        t3 = time.time()
-        logger.info(
-            "[MoE timing] shard_fp8_to_tpu: %.2fs, process_fp8_moe_weights: %.2fs, shard_moe_weights: %.2fs",
-            t1 - t0, t2 - t1, t3 - t2)
 
         layer.w13_weight = Parameter(weights.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(weights.w2_weight, requires_grad=False)
