@@ -509,16 +509,11 @@ def process_fp8_moe_weights(
     else:
         shard_axis = mesh.axis_names[0]
 
-    # Compute scan batch size based on LOCAL experts (per-device).
-    shard_axis_size = get_mesh_shape_product(mesh, shard_axis)
-    num_experts = w13_weight.shape[0]
-    num_local_experts = num_experts // shard_axis_size
-
-    requant_memory_budget = 0.5
-    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_TENSOR)
-    target = max(1, int(requant_memory_budget * tp_size))
-    scan_batch_size = max(d for d in range(1, target + 1)
-                          if num_local_experts % d == 0)
+    # Use batch_size=1 to minimize per-step FP32 intermediates,
+    # which reduces XLA program reservation (bytes_reserved).
+    # With shard_map, total FLOPs are the same regardless of batch size
+    # and speed is equivalent (~0.05s/layer for both batch=1 and batch=4).
+    scan_batch_size = 1
 
     # Pad widths for the batched case (3D tensors with expert dim).
     w13_pad_3d = ((0, 0), ) + w13_pad
