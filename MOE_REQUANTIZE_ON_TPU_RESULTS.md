@@ -29,6 +29,25 @@ Command: `python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Inst
 
 - **Inference correctness**: Tests 1 and 2 both produced correct, sensible outputs. Test 3 loaded successfully but crashed at inference time (attention sharding).
 
+## JAX Path (MODEL_IMPL_TYPE=flax_nnx)
+
+Model: Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
+Command: `MODEL_IMPL_TYPE=flax_nnx HF_HOME=/dev/shm/hf_cache python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128`
+
+| Metric | Flag OFF | Flag ON |
+|--------|----------|---------|
+| reserved | 0.000G | 0.403G |
+| peak_reserved | 0.000G | 0.403G |
+| in_use | 0.156G | 0.769G |
+| peak_in_use | 2.489G | 2.489G |
+
+### Notes
+
+- Both tests crash during attention inference with `AssertionError: Shape mismatch when loading weight 'model.layers.0.self_attn.k_proj.weight': torch (512, 4096) vs jax (1024, 4096)`. This is a pre-existing Qwen3-235B compatibility issue with the flax_nnx path, unrelated to the requantization flag.
+- MoE weight loading and requantization completes successfully in both cases before the crash.
+- Flag OFF correctly uses `cpu_mesh_context()` to run JIT on CPU devices. Without this fix, the flag-off path would crash with `ValueError: Received incompatible devices for jitted computation` (CPU weights vs TPU mesh).
+- The `reserved` and `in_use` patterns match the vllm path: flag ON adds ~0.403G for the shard_map TPU program, flag OFF has zero reservation.
+
 ## Conclusion
 
 The `MOE_REQUANTIZE_ON_TPU` flag correctly gates between:
