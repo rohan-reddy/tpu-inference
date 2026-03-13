@@ -48,6 +48,41 @@ Command: `MODEL_IMPL_TYPE=flax_nnx HF_HOME=/dev/shm/hf_cache python examples/off
 - Flag OFF correctly uses `cpu_mesh_context()` to run JIT on CPU devices. Without this fix, the flag-off path would crash with `ValueError: Received incompatible devices for jitted computation` (CPU weights vs TPU mesh).
 - The `reserved` and `in_use` patterns match the vllm path: flag ON adds ~0.403G for the shard_map TPU program, flag OFF has zero reservation.
 
+## Commands Used
+
+Python: `~/work-dir/vllm_env/bin/python` (3.12.13)
+Model cache: `HF_HOME=/dev/shm/hf_cache`
+
+### vLLM path
+
+```bash
+# Test 1: Flag OFF, 2D mesh
+HF_HOME=/dev/shm/hf_cache ~/work-dir/vllm_env/bin/python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128
+
+# Test 2: Flag ON, 2D mesh
+HF_HOME=/dev/shm/hf_cache MOE_REQUANTIZE_ON_TPU=1 ~/work-dir/vllm_env/bin/python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128
+
+# Test 3: Flag ON, 5D mesh
+HF_HOME=/dev/shm/hf_cache MOE_REQUANTIZE_ON_TPU=1 NEW_MODEL_DESIGN=1 ~/work-dir/vllm_env/bin/python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128
+```
+
+### JAX path (flax_nnx)
+
+```bash
+# Flag OFF
+HF_HOME=/dev/shm/hf_cache MODEL_IMPL_TYPE=flax_nnx ~/work-dir/vllm_env/bin/python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128
+
+# Flag ON
+HF_HOME=/dev/shm/hf_cache MODEL_IMPL_TYPE=flax_nnx MOE_REQUANTIZE_ON_TPU=1 ~/work-dir/vllm_env/bin/python examples/offline_inference.py --model Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 --tensor-parallel-size 8 --max-model-len 1024 --max-num-batched-tokens 128
+```
+
+### Unit tests
+
+```bash
+~/work-dir/vllm_env/bin/python -m pytest tests/layers/vllm/test_fp8.py::test_fused_moe -x -q
+~/work-dir/vllm_env/bin/python -m pytest tests/layers/jax/quantization/test_fp8.py::TestFp8FusedMoE -x -q
+```
+
 ## Conclusion
 
 The `MOE_REQUANTIZE_ON_TPU` flag correctly gates between:
